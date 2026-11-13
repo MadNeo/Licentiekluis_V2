@@ -1,12 +1,14 @@
 """Voorlopige lokale kern van LicentieKluis; nog niet geschikt voor productie."""
-import os, secrets, hashlib, datetime as dt
+import os, secrets, hashlib, datetime as dt, hmac, smtplib, ssl
+from email.message import EmailMessage
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, String, Integer, Boolean, ForeignKey, Text, select, func
+from sqlalchemy import create_engine, String, Integer, Boolean, ForeignKey, Text, select, func, delete, update, or_
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
 from argon2 import PasswordHasher
 from cryptography.fernet import Fernet
+import pyotp
 
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./licentiekluis.db')
 engine = create_engine(DATABASE_URL, connect_args={'check_same_thread': False} if DATABASE_URL.startswith('sqlite') else {})
@@ -19,6 +21,9 @@ class Account(Base):
     role:Mapped[str]=mapped_column(String(30))
     active:Mapped[bool]=mapped_column(Boolean,default=True)
     person_id:Mapped[int|None]=mapped_column(ForeignKey('persons.id'),nullable=True)
+    totp_secret:Mapped[str|None]=mapped_column(Text,nullable=True)
+    totp_pending:Mapped[str|None]=mapped_column(Text,nullable=True)
+    totp_last_counter:Mapped[int|None]=mapped_column(Integer,nullable=True)
 class Person(Base):
     __tablename__='persons'
     id:Mapped[int]=mapped_column(primary_key=True)
@@ -53,6 +58,22 @@ class LoginSession(Base):
     account_id:Mapped[int]=mapped_column(ForeignKey('accounts.id'))
     csrf:Mapped[str]=mapped_column(String(100))
     expires:Mapped[dt.datetime]=mapped_column()
+    stage:Mapped[str]=mapped_column(String(20),default='full')
+class RecoveryCode(Base):
+    __tablename__='recovery_codes'
+    code_hash:Mapped[str]=mapped_column(String(64),primary_key=True)
+    account_id:Mapped[int]=mapped_column(ForeignKey('accounts.id',ondelete='CASCADE'),index=True)
+class LoginAttempt(Base):
+    __tablename__='login_attempts'
+    id:Mapped[int]=mapped_column(primary_key=True)
+    username_hash:Mapped[str]=mapped_column(String(64),index=True)
+    source_hash:Mapped[str]=mapped_column(String(64),index=True)
+    created:Mapped[dt.datetime]=mapped_column(index=True)
+class ResetCode(Base):
+    __tablename__='reset_codes'
+    code_hash:Mapped[str]=mapped_column(String(64),primary_key=True)
+    account_id:Mapped[int]=mapped_column(ForeignKey('accounts.id',ondelete='CASCADE'),index=True)
+    expires:Mapped[dt.datetime]=mapped_column()
 class Audit(Base):
     __tablename__='audit'
     id:Mapped[int]=mapped_column(primary_key=True)
@@ -62,6 +83,7 @@ class Audit(Base):
 
 app=FastAPI(title='LicentieKluis API',version='0.1.0')
 ph=PasswordHasher()
+dummy_password_hash=ph.hash(secrets.token_urlsafe(32))
 def db():
     with Session(engine) as s: yield s
 def key():
@@ -70,19 +92,33 @@ def key():
     try: return Fernet(value.encode())
     except Exception: raise HTTPException(503,'Ongeldige encryptiesleutel')
 def digest(v): return hashlib.sha256(v.encode()).hexdigest()
-def current(request:Request,s:Session=Depends(db)):
+def session_account(request:Request,s:Session):
     token=request.cookies.get('lk_session','')
     sess=s.get(LoginSession,digest(token)) if token else None
     if not sess or sess.expires < dt.datetime.utcnow(): raise HTTPException(401,'Log eerst in')
     account=s.get(Account,sess.account_id)
     if not account or not account.active: raise HTTPException(401,'Account niet beschikbaar')
     if request.method not in ('GET','HEAD','OPTIONS') and not secrets.compare_digest(request.headers.get('X-CSRF-Token',''),sess.csrf): raise HTTPException(403,'Ongeldig CSRF-token')
+    return account,sess
+def current(request:Request,s:Session=Depends(db)):
+    account,sess=session_account(request,s)
+    if sess.stage!='full': raise HTTPException(403,'Tweefactorauthenticatie vereist')
+    if account.role in ('admin','manager') and not account.totp_secret: raise HTTPException(403,'Tweefactorauthenticatie instellen is vereist')
     return account
+def admin(a:Account=Depends(current)):
+    if a.role!='admin': raise HTTPException(403,'Onvoldoende rechten')
+    return a
 def manager(a:Account=Depends(current)):
     if a.role not in ('admin','manager'): raise HTTPException(403,'Onvoldoende rechten')
     return a
 def audit(s,a,action): s.add(Audit(account_id=a.id,action=action))
-class Login(BaseModel): username:str; password:str
+class Login(BaseModel): username:str=Field(max_length=120); password:str=Field(max_length=1024)
+class CodeIn(BaseModel): code:str=Field(min_length=6,max_length=40)
+class PasswordChange(BaseModel): current_password:str; new_password:str=Field(min_length=12,max_length=1024)
+class AccountIn(BaseModel): username:str=Field(min_length=1,max_length=120); password:str=Field(min_length=12,max_length=1024); role:str; person_id:int|None=None
+class AccountUpdate(BaseModel): role:str; active:bool; person_id:int|None=None
+class ResetRequest(BaseModel): username:str=Field(min_length=1,max_length=120)
+class ResetPassword(BaseModel): username:str=Field(min_length=1,max_length=120); code:str=Field(min_length=16,max_length=128); new_password:str=Field(min_length=12,max_length=1024)
 class PersonIn(BaseModel): name:str=Field(min_length=1,max_length=200); email:str=Field(min_length=3,max_length=254); department:str=''
 class LicenseIn(BaseModel):
     reference:str=Field(min_length=1,max_length=100); name:str=Field(min_length=1,max_length=200); vendor:str=Field(min_length=1,max_length=200); license_type:str='abonnement'; seats:int=Field(ge=1,le=1000000); end_date:dt.date|None=None; product_key:str|None=None
@@ -94,22 +130,137 @@ async def headers(request,call_next):
 def live(): return {'status':'ok'}
 @app.get('/api/v1/health/ready')
 def ready(s:Session=Depends(db)): s.execute(select(1)); return {'status':'ok'}
+def check_rate(s,username,request):
+    now=dt.datetime.utcnow(); cutoff=now-dt.timedelta(minutes=15)
+    source=request.client.host if request.client else 'unknown'
+    uh=digest(username.casefold()); sh=digest(source)
+    # Count both account and network origin independently, including nonexistent accounts.
+    if s.scalar(select(func.count()).select_from(LoginAttempt).where(LoginAttempt.username_hash==uh,LoginAttempt.created>=cutoff))>=5 or s.scalar(select(func.count()).select_from(LoginAttempt).where(LoginAttempt.source_hash==sh,LoginAttempt.created>=cutoff))>=30:
+        raise HTTPException(429,'Te veel pogingen. Probeer het later opnieuw.')
+    return uh,sh,now
+def failed(s,values):
+    uh,sh,now=values; s.add(LoginAttempt(username_hash=uh,source_hash=sh,created=now)); s.commit()
+def verify_password(a,password):
+    try: return bool(ph.verify(a.password_hash if a else dummy_password_hash,password) and a)
+    except Exception: return False
+def verify_factor(s,a,code):
+    if a.totp_secret and code.isdigit() and len(code)==6:
+        counter=int(dt.datetime.now(dt.timezone.utc).timestamp())//30
+        totp=pyotp.TOTP(key().decrypt(a.totp_secret.encode()).decode())
+        for c in (counter-1,counter,counter+1):
+            if hmac.compare_digest(totp.at(c*30),code):
+                result=s.execute(update(Account).where(Account.id==a.id,or_(Account.totp_last_counter.is_(None),Account.totp_last_counter<c)).values(totp_last_counter=c))
+                if result.rowcount==1: return True
+    hashed=digest(code.strip().upper())
+    result=s.execute(delete(RecoveryCode).where(RecoveryCode.account_id==a.id,RecoveryCode.code_hash==hashed))
+    return result.rowcount==1
 @app.post('/api/v1/login')
-def login(data:Login,response:Response,s:Session=Depends(db)):
+def login(data:Login,response:Response,request:Request,s:Session=Depends(db)):
+    rate=check_rate(s,data.username,request)
     a=s.scalar(select(Account).where(Account.username==data.username))
-    try: valid=bool(a and a.active and ph.verify(a.password_hash,data.password))
-    except Exception: valid=False
-    if not valid: raise HTTPException(401,'Onjuiste gebruikersnaam of wachtwoord')
+    valid=verify_password(a,data.password) and a.active
+    if not valid:
+        failed(s,rate); raise HTTPException(401,'Onjuiste gebruikersnaam of wachtwoord')
     token=secrets.token_urlsafe(32); csrf=secrets.token_urlsafe(32)
-    s.add(LoginSession(token_hash=digest(token),account_id=a.id,csrf=csrf,expires=dt.datetime.utcnow()+dt.timedelta(hours=8))); audit(s,a,'login'); s.commit()
+    stage='verify' if a.totp_secret else ('enroll' if a.role in ('admin','manager') else 'full')
+    s.add(LoginSession(token_hash=digest(token),account_id=a.id,csrf=csrf,stage=stage,expires=dt.datetime.utcnow()+dt.timedelta(minutes=10) if stage!='full' else dt.datetime.utcnow()+dt.timedelta(hours=8))); audit(s,a,'login_password_verified'); s.commit()
     response.set_cookie('lk_session',token,httponly=True,secure=os.getenv('COOKIE_SECURE','true')=='true',samesite='strict',max_age=28800,path='/')
-    return {'username':a.username,'role':a.role,'csrf':csrf}
+    return {'username':a.username,'role':a.role,'csrf':csrf,'stage':stage,'mfa':bool(a.totp_secret)}
 @app.get('/api/v1/me')
-def me(request:Request,a:Account=Depends(current),s:Session=Depends(db)):
-    session=s.get(LoginSession,digest(request.cookies['lk_session'])); return {'username':a.username,'role':a.role,'csrf':session.csrf}
+def me(request:Request,s:Session=Depends(db)):
+    a,session=session_account(request,s); return {'username':a.username,'role':a.role,'csrf':session.csrf,'stage':session.stage,'mfa':bool(a.totp_secret)}
 @app.post('/api/v1/logout')
-def logout(request:Request,response:Response,a:Account=Depends(current),s:Session=Depends(db)):
+def logout(request:Request,response:Response,s:Session=Depends(db)):
+    a,_=session_account(request,s)
     sess=s.get(LoginSession,digest(request.cookies['lk_session'])); s.delete(sess); audit(s,a,'logout'); s.commit(); response.delete_cookie('lk_session',path='/'); return {'ok':True}
+def promote(response,s,sess,a):
+    token=secrets.token_urlsafe(32); csrf=secrets.token_urlsafe(32)
+    s.delete(sess); s.add(LoginSession(token_hash=digest(token),account_id=a.id,csrf=csrf,stage='full',expires=dt.datetime.utcnow()+dt.timedelta(hours=8)))
+    audit(s,a,'login_mfa_verified'); s.commit()
+    response.set_cookie('lk_session',token,httponly=True,secure=os.getenv('COOKIE_SECURE','true')=='true',samesite='strict',max_age=28800,path='/')
+    return {'username':a.username,'role':a.role,'csrf':csrf,'stage':'full','mfa':bool(a.totp_secret)}
+@app.post('/api/v1/mfa/setup')
+def setup_mfa(request:Request,s:Session=Depends(db)):
+    a,sess=session_account(request,s)
+    if a.totp_secret: raise HTTPException(409,'Tweefactorauthenticatie is al actief')
+    if sess.stage not in ('full','enroll'): raise HTTPException(403,'Niet toegestaan')
+    secret=pyotp.random_base32(); a.totp_pending=key().encrypt(secret.encode()).decode(); s.commit()
+    return {'secret':secret,'uri':pyotp.TOTP(secret).provisioning_uri(name=a.username,issuer_name='LicentieKluis')}
+@app.post('/api/v1/mfa/confirm')
+def confirm_mfa(data:CodeIn,request:Request,response:Response,s:Session=Depends(db)):
+    a,sess=session_account(request,s); rate=check_rate(s,a.username,request)
+    if not a.totp_pending or a.totp_secret: raise HTTPException(400,'Start eerst de instelling')
+    secret=key().decrypt(a.totp_pending.encode()).decode()
+    if not pyotp.TOTP(secret).verify(data.code,valid_window=1): failed(s,rate); raise HTTPException(401,'Ongeldige code')
+    a.totp_secret=a.totp_pending; a.totp_pending=None; a.totp_last_counter=int(dt.datetime.now(dt.timezone.utc).timestamp())//30
+    codes=[secrets.token_hex(8).upper() for _ in range(10)]
+    s.execute(delete(RecoveryCode).where(RecoveryCode.account_id==a.id))
+    s.add_all([RecoveryCode(account_id=a.id,code_hash=digest(code)) for code in codes]); audit(s,a,'mfa_enabled')
+    result=promote(response,s,sess,a); result['recovery_codes']=codes; return result
+@app.post('/api/v1/mfa/verify')
+def verify_mfa(data:CodeIn,request:Request,response:Response,s:Session=Depends(db)):
+    a,sess=session_account(request,s)
+    if sess.stage!='verify': raise HTTPException(400,'Geen tweede factor vereist')
+    rate=check_rate(s,a.username,request)
+    if not verify_factor(s,a,data.code): failed(s,rate); raise HTTPException(401,'Ongeldige code')
+    return promote(response,s,sess,a)
+@app.post('/api/v1/password')
+def change_password(data:PasswordChange,request:Request,a:Account=Depends(current),s:Session=Depends(db)):
+    rate=check_rate(s,a.username,request)
+    if not verify_password(a,data.current_password): failed(s,rate); raise HTTPException(401,'Onjuist wachtwoord')
+    a.password_hash=ph.hash(data.new_password); s.execute(delete(LoginSession).where(LoginSession.account_id==a.id)); audit(s,a,'password_changed'); s.commit(); return {'ok':True}
+@app.post('/api/v1/password/reset-request')
+def request_reset(data:ResetRequest,request:Request,s:Session=Depends(db)):
+    rate=check_rate(s,'reset:'+data.username,request); failed(s,rate)
+    account=s.scalar(select(Account).where(Account.username==data.username,Account.active==True))
+    person=s.get(Person,account.person_id) if account and account.person_id else None
+    host=os.getenv('SMTP_HOST'); sender=os.getenv('SMTP_FROM')
+    if host and sender and person and person.active:
+        code=secrets.token_hex(24).upper(); message=EmailMessage()
+        message['Subject']='LicentieKluis wachtwoordherstel'; message['From']=sender; message['To']=person.email
+        message.set_content('Gebruik deze eenmalige herstelcode binnen 15 minuten in LicentieKluis:\n\n'+code+'\n\nNegeer dit bericht als u geen herstel heeft aangevraagd.')
+        try:
+            with smtplib.SMTP(host,int(os.getenv('SMTP_PORT','587')),timeout=10) as smtp:
+                smtp.starttls(context=ssl.create_default_context())
+                if os.getenv('SMTP_USER'): smtp.login(os.environ['SMTP_USER'],os.environ.get('SMTP_PASSWORD',''))
+                smtp.send_message(message)
+            s.execute(delete(ResetCode).where(ResetCode.account_id==account.id))
+            s.add(ResetCode(code_hash=digest(code),account_id=account.id,expires=dt.datetime.utcnow()+dt.timedelta(minutes=15))); audit(s,account,'password_reset_requested'); s.commit()
+        except (OSError,smtplib.SMTPException,ValueError):
+            s.rollback()
+    return {'ok':True,'message':'Als herstel beschikbaar is, ontvangt u een code.'}
+@app.post('/api/v1/password/reset')
+def reset_password(data:ResetPassword,request:Request,s:Session=Depends(db)):
+    rate=check_rate(s,'reset:'+data.username,request)
+    account=s.scalar(select(Account).where(Account.username==data.username,Account.active==True))
+    token=s.get(ResetCode,digest(data.code.strip().upper()))
+    if not account or not token or token.account_id!=account.id or token.expires<dt.datetime.utcnow():
+        failed(s,rate); raise HTTPException(400,'Ongeldige of verlopen herstelcode')
+    result=s.execute(delete(ResetCode).where(ResetCode.code_hash==token.code_hash))
+    if result.rowcount!=1: raise HTTPException(400,'Ongeldige of verlopen herstelcode')
+    account.password_hash=ph.hash(data.new_password); s.execute(delete(ResetCode).where(ResetCode.account_id==account.id)); s.execute(delete(LoginSession).where(LoginSession.account_id==account.id)); audit(s,account,'password_reset'); s.commit(); return {'ok':True}
+@app.get('/api/v1/accounts')
+def list_accounts(a:Account=Depends(admin),s:Session=Depends(db)):
+    return [{'id':x.id,'username':x.username,'role':x.role,'active':x.active,'person_id':x.person_id,'mfa':bool(x.totp_secret)} for x in s.scalars(select(Account).order_by(Account.username))]
+@app.post('/api/v1/accounts')
+def create_account(data:AccountIn,a:Account=Depends(admin),s:Session=Depends(db)):
+    if data.role not in ('admin','manager','user'): raise HTTPException(422,'Ongeldige rol')
+    if data.person_id and not s.get(Person,data.person_id): raise HTTPException(422,'Persoon niet gevonden')
+    if data.role=='user' and not data.person_id: raise HTTPException(422,'Koppel een persoon aan de gebruiker')
+    if s.scalar(select(Account).where(Account.username==data.username)): raise HTTPException(409,'Account bestaat al')
+    item=Account(username=data.username,password_hash=ph.hash(data.password),role=data.role,person_id=data.person_id); s.add(item); s.flush(); audit(s,a,f'account_created:{item.id}'); s.commit(); return {'id':item.id}
+@app.put('/api/v1/accounts/{account_id}')
+def update_account(account_id:int,data:AccountUpdate,a:Account=Depends(admin),s:Session=Depends(db)):
+    item=s.get(Account,account_id)
+    if not item: raise HTTPException(404,'Account niet gevonden')
+    if data.role not in ('admin','manager','user'): raise HTTPException(422,'Ongeldige rol')
+    if data.person_id and not s.get(Person,data.person_id): raise HTTPException(422,'Persoon niet gevonden')
+    if data.role=='user' and not data.person_id: raise HTTPException(422,'Koppel een persoon aan de gebruiker')
+    if item.id==a.id and (not data.active or data.role!='admin'): raise HTTPException(400,'Eigen beheerrechten kunnen niet worden verwijderd')
+    if (item.role,item.active,item.person_id)!=(data.role,data.active,data.person_id):
+        item.role=data.role; item.active=data.active; item.person_id=data.person_id
+        s.execute(delete(LoginSession).where(LoginSession.account_id==item.id)); audit(s,a,f'account_updated:{item.id}'); s.commit()
+    return {'ok':True}
 @app.get('/api/v1/persons')
 def persons(a:Account=Depends(manager),s:Session=Depends(db)):
     return [{'id':p.id,'name':p.name,'email':p.email,'department':p.department,'active':p.active} for p in s.scalars(select(Person).order_by(Person.name))]
