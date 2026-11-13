@@ -4,17 +4,26 @@ from email.message import EmailMessage
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, String, Integer, Boolean, ForeignKey, Text, select, func, delete, update, or_
+from sqlalchemy import create_engine, String, Integer, Boolean, ForeignKey, Text, CheckConstraint, Index, event, select, func, delete, update, or_, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+from alembic.migration import MigrationContext
 from argon2 import PasswordHasher
 from cryptography.fernet import Fernet
 import pyotp
 
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///./licentiekluis.db')
 engine = create_engine(DATABASE_URL, connect_args={'check_same_thread': False} if DATABASE_URL.startswith('sqlite') else {})
+if DATABASE_URL.startswith('sqlite'):
+    @event.listens_for(engine, 'connect')
+    def sqlite_foreign_keys(connection, _):
+        connection.execute('PRAGMA foreign_keys=ON')
 class Base(DeclarativeBase): pass
 class Account(Base):
     __tablename__='accounts'
+    __table_args__=(CheckConstraint("role IN ('admin', 'manager', 'user')",name='ck_accounts_role'),)
     id:Mapped[int]=mapped_column(primary_key=True)
     username:Mapped[str]=mapped_column(String(120), unique=True)
     password_hash:Mapped[str]=mapped_column(String(255))
@@ -38,6 +47,7 @@ class Product(Base):
     vendor:Mapped[str]=mapped_column(String(200))
 class License(Base):
     __tablename__='licenses'
+    __table_args__=(CheckConstraint('seats > 0',name='ck_licenses_seats_positive'),)
     id:Mapped[int]=mapped_column(primary_key=True)
     reference:Mapped[str]=mapped_column(String(100),unique=True)
     product_id:Mapped[int]=mapped_column(ForeignKey('products.id'))
@@ -48,12 +58,14 @@ class License(Base):
     archived:Mapped[bool]=mapped_column(Boolean,default=False)
 class Assignment(Base):
     __tablename__='assignments'
+    __table_args__=(Index('uq_assignments_active_license_person','license_id','person_id',unique=True,postgresql_where=text('active = true'),sqlite_where=text('active = 1')),Index('ix_assignments_license_active','license_id','active'))
     id:Mapped[int]=mapped_column(primary_key=True)
     license_id:Mapped[int]=mapped_column(ForeignKey('licenses.id'))
     person_id:Mapped[int]=mapped_column(ForeignKey('persons.id'))
     active:Mapped[bool]=mapped_column(Boolean,default=True)
 class LoginSession(Base):
     __tablename__='sessions'
+    __table_args__=(CheckConstraint("stage IN ('full', 'enroll', 'verify')",name='ck_sessions_stage'),Index('ix_sessions_account_id','account_id'))
     token_hash:Mapped[str]=mapped_column(String(64),primary_key=True)
     account_id:Mapped[int]=mapped_column(ForeignKey('accounts.id'))
     csrf:Mapped[str]=mapped_column(String(100))
@@ -77,7 +89,7 @@ class ResetCode(Base):
 class Audit(Base):
     __tablename__='audit'
     id:Mapped[int]=mapped_column(primary_key=True)
-    account_id:Mapped[int]=mapped_column(Integer)
+    account_id:Mapped[int]=mapped_column(ForeignKey('accounts.id'))
     action:Mapped[str]=mapped_column(String(100))
     created:Mapped[dt.datetime]=mapped_column(default=lambda:dt.datetime.now(dt.timezone.utc))
 
@@ -129,7 +141,14 @@ async def headers(request,call_next):
 @app.get('/api/v1/health/live')
 def live(): return {'status':'ok'}
 @app.get('/api/v1/health/ready')
-def ready(s:Session=Depends(db)): s.execute(select(1)); return {'status':'ok'}
+def ready(s:Session=Depends(db)):
+    try:
+        current_revision=MigrationContext.configure(s.connection()).get_current_revision()
+        expected_revision=ScriptDirectory.from_config(Config(str(Path(__file__).resolve().parents[1]/'alembic.ini'))).get_current_head()
+        if not current_revision or current_revision!=expected_revision: raise HTTPException(503,'Database niet gereed')
+    except SQLAlchemyError:
+        raise HTTPException(503,'Database niet gereed') from None
+    return {'status':'ok'}
 def check_rate(s,username,request):
     now=dt.datetime.utcnow(); cutoff=now-dt.timedelta(minutes=15)
     source=request.client.host if request.client else 'unknown'
@@ -248,7 +267,12 @@ def create_account(data:AccountIn,a:Account=Depends(admin),s:Session=Depends(db)
     if data.person_id and not s.get(Person,data.person_id): raise HTTPException(422,'Persoon niet gevonden')
     if data.role=='user' and not data.person_id: raise HTTPException(422,'Koppel een persoon aan de gebruiker')
     if s.scalar(select(Account).where(Account.username==data.username)): raise HTTPException(409,'Account bestaat al')
-    item=Account(username=data.username,password_hash=ph.hash(data.password),role=data.role,person_id=data.person_id); s.add(item); s.flush(); audit(s,a,f'account_created:{item.id}'); s.commit(); return {'id':item.id}
+    item=Account(username=data.username,password_hash=ph.hash(data.password),role=data.role,person_id=data.person_id); s.add(item)
+    try:
+        s.flush(); audit(s,a,f'account_created:{item.id}'); s.commit()
+    except IntegrityError:
+        s.rollback(); raise HTTPException(409,'Account of koppeling bestaat niet of is al in gebruik') from None
+    return {'id':item.id}
 @app.put('/api/v1/accounts/{account_id}')
 def update_account(account_id:int,data:AccountUpdate,a:Account=Depends(admin),s:Session=Depends(db)):
     item=s.get(Account,account_id)
@@ -267,7 +291,11 @@ def persons(a:Account=Depends(manager),s:Session=Depends(db)):
 @app.post('/api/v1/persons')
 def add_person(data:PersonIn,a:Account=Depends(manager),s:Session=Depends(db)):
     if s.scalar(select(Person).where(Person.email==data.email)): raise HTTPException(409,'E-mailadres bestaat al')
-    p=Person(**data.model_dump()); s.add(p); audit(s,a,'person_created'); s.commit(); return {'id':p.id}
+    p=Person(**data.model_dump()); s.add(p); audit(s,a,'person_created')
+    try: s.commit()
+    except IntegrityError:
+        s.rollback(); raise HTTPException(409,'E-mailadres bestaat al') from None
+    return {'id':p.id}
 @app.get('/api/v1/licenses')
 def licenses(a:Account=Depends(current),s:Session=Depends(db)):
     q=select(License,Product).join(Product)
@@ -280,10 +308,14 @@ def licenses(a:Account=Depends(current),s:Session=Depends(db)):
 @app.post('/api/v1/licenses')
 def add_license(data:LicenseIn,a:Account=Depends(manager),s:Session=Depends(db)):
     if s.scalar(select(License).where(License.reference==data.reference)): raise HTTPException(409,'Referentie bestaat al')
-    p=Product(name=data.name,vendor=data.vendor); s.add(p); s.flush(); l=License(reference=data.reference,product_id=p.id,license_type=data.license_type,seats=data.seats,end_date=data.end_date.isoformat() if data.end_date else None,encrypted_key=key().encrypt(data.product_key.encode()).decode() if data.product_key else None); s.add(l); audit(s,a,'license_created'); s.commit(); return {'id':l.id}
+    p=Product(name=data.name,vendor=data.vendor); s.add(p); s.flush(); l=License(reference=data.reference,product_id=p.id,license_type=data.license_type,seats=data.seats,end_date=data.end_date.isoformat() if data.end_date else None,encrypted_key=key().encrypt(data.product_key.encode()).decode() if data.product_key else None); s.add(l); audit(s,a,'license_created')
+    try: s.commit()
+    except IntegrityError:
+        s.rollback(); raise HTTPException(409,'Referentie bestaat al of licentiegegevens zijn ongeldig') from None
+    return {'id':l.id}
 @app.post('/api/v1/assignments')
 def assign(data:AssignmentIn,a:Account=Depends(manager),s:Session=Depends(db)):
-    l=s.scalar(select(License).where(License.id==data.license_id).with_for_update()); p=s.get(Person,data.person_id)
+    l=s.scalar(select(License).where(License.id==data.license_id).with_for_update()); p=s.scalar(select(Person).where(Person.id==data.person_id).with_for_update())
     if not l or not p: raise HTTPException(404,'Licentie of persoon niet gevonden')
     if not p.active or l.archived or (l.end_date and l.end_date<dt.date.today().isoformat()): raise HTTPException(400,'Toewijzing niet toegestaan')
     if s.scalar(select(Assignment).where(Assignment.license_id==l.id,Assignment.person_id==p.id,Assignment.active==True)): raise HTTPException(409,'Al toegewezen')

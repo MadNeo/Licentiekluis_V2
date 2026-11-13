@@ -98,15 +98,15 @@ def test_manager_cannot_manage_accounts(db):
     assert db.get('/api/v1/accounts').status_code==403
     assert db.post('/api/v1/accounts',headers=headers(me),json={'username':'evil','password':'very-long-password','role':'admin'}).status_code==403
 
-def test_auth_migration_keeps_accounts_and_revokes_sessions(tmp_path):
+def test_legacy_database_is_not_overwritten(tmp_path):
     import sqlite3, subprocess
     path=tmp_path/'old.db'
     with sqlite3.connect(path) as conn:
-        conn.executescript("CREATE TABLE accounts (id INTEGER PRIMARY KEY, username VARCHAR(120) NOT NULL UNIQUE, password_hash VARCHAR(255) NOT NULL, role VARCHAR(30) NOT NULL, active BOOLEAN NOT NULL, person_id INTEGER); CREATE TABLE sessions (token_hash VARCHAR(64) PRIMARY KEY, account_id INTEGER NOT NULL, csrf VARCHAR(100) NOT NULL, expires DATETIME NOT NULL); INSERT INTO accounts VALUES (1,'oud','hash','admin',1,NULL); INSERT INTO sessions VALUES ('old',1,'csrf','2030-01-01');")
+        conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, username TEXT)")
+        conn.execute("INSERT INTO accounts VALUES (1,'oud')")
     env=os.environ.copy(); env['DATABASE_URL']='sqlite:///'+str(path)
     cli=Path(__file__).resolve().parents[1]/'backend'/'cli.py'
-    for _ in range(2): subprocess.run([sys.executable,str(cli),'migrate-auth'],env=env,check=True,capture_output=True)
+    result=subprocess.run([sys.executable,str(cli),'init'],env=env,capture_output=True,text=True)
+    assert result.returncode!=0 and 'zonder migratieversie' in result.stderr
     with sqlite3.connect(path) as conn:
         assert conn.execute('SELECT username FROM accounts').fetchone()[0]=='oud'
-        assert conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]==0
-        assert 'totp_secret' in {c[1] for c in conn.execute('PRAGMA table_info(accounts)')}

@@ -80,6 +80,6 @@ Vanaf nu is bij het aanmelden naast het wachtwoord een authenticatorcode of een 
 - **Wachtwoord vergeten:** voer vanuit de map `backend` lokaal `../.venv/bin/python cli.py reset-password --username beheerder` uit. Vervang de naam indien nodig. Alle sessies van dit account worden ingetrokken.
 - **Authenticator en herstelcodes kwijt:** voer vanuit de map `backend` lokaal `../.venv/bin/python cli.py reset-mfa --username beheerder` uit. De bestaande tweede factor, herstelcodes en sessies worden ongeldig; stel TOTP opnieuw in bij de volgende aanmelding.
 - **Encryptiesleutel kwijt:** herstel de oorspronkelijke sleutel uit een veilige kopie. Maak niet zomaar een nieuwe sleutel aan voor een bestaande database: daarmee kun je de eerder versleutelde gegevens niet ontsleutelen.
-- **Bestaande oudere ontwikkelingsdatabase:** maak eerst een back-up en volg de instructie voor `migrate-auth` in de README. Draai geen migratie zonder de juiste database en sleutel te controleren.
+- **Bestaande oudere ontwikkelingsdatabase:** maak eerst een back-up en volg de [overzetprocedure](postgresql.md#bestaande-sqlite-ontwikkelgegevens-overzetten). Draai geen migratie zonder de juiste database en sleutel te controleren.
 
 De lokale herstelcommando's zijn alleen bedoeld voor bevoegde systeembeheerders. Beperk daarom de toegang tot de machine, de database en het sleutelbestand.

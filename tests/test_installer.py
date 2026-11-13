@@ -18,6 +18,8 @@ def installation(tmp_path):
     project=Path(__file__).resolve().parents[1]
     shutil.copytree(project/'backend',tmp_path/'backend',ignore=shutil.ignore_patterns('__pycache__','*.db'))
     shutil.copy(project/'install.sh',tmp_path/'install.sh')
+    shutil.copy(project/'alembic.ini',tmp_path/'alembic.ini')
+    shutil.copytree(project/'migrations',tmp_path/'migrations',ignore=shutil.ignore_patterns('__pycache__'))
     (tmp_path/'.venv').symlink_to(Path(sys.executable).parent.parent, target_is_directory=True)
     database=tmp_path/'installer.db'
     env=os.environ.copy(); env['DATABASE_URL']='sqlite:///'+str(database)

@@ -1,25 +1,22 @@
 """Lokale beheercommando's; alleen toegankelijk voor de systeembeheerder."""
 import getpass, argparse, sys
+from pathlib import Path
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import select, delete, inspect, text
 from sqlalchemy.orm import Session
 from app import Base,engine,Account,Person,LoginSession,RecoveryCode,Audit,ph
 
 p=argparse.ArgumentParser(); p.add_argument('command',choices=['init','migrate-auth','bootstrap-admin','account','reset-password','reset-mfa']); p.add_argument('--username'); p.add_argument('--role',choices=['admin','manager','user'],default='admin'); p.add_argument('--person-id',type=int); args=p.parse_args()
 if args.command=='init':
-    Base.metadata.create_all(engine); print('Database aangemaakt. Voor bestaande databases: voer migrate-auth uit.')
+    tables=set(inspect(engine).get_table_names())
+    if tables and 'alembic_version' not in tables:
+        raise SystemExit('Bestaande database zonder migratieversie: maak eerst een back-up en gebruik de overzetprocedure in docs/postgresql.md.')
+    config=Config(str(Path(__file__).resolve().parents[1]/'alembic.ini'))
+    command.upgrade(config,'head')
+    print('Databasemigraties uitgevoerd.')
 elif args.command=='migrate-auth':
-    # Only the three nullable columns added to the initial development schema are changed.
-    with engine.begin() as connection:
-        schema=inspect(connection)
-        if 'accounts' not in schema.get_table_names(): raise SystemExit('Initialiseer eerst de database.')
-        columns={c['name'] for c in schema.get_columns('accounts')}
-        for column,kind in [('totp_secret','TEXT'),('totp_pending','TEXT'),('totp_last_counter','INTEGER')]:
-            if column not in columns: connection.execute(text(f'ALTER TABLE accounts ADD COLUMN {column} {kind}'))
-        session_columns={c['name'] for c in inspect(connection).get_columns('sessions')}
-        if 'stage' not in session_columns: connection.execute(text("ALTER TABLE sessions ADD COLUMN stage VARCHAR(20) NOT NULL DEFAULT 'full'"))
-        # Old sessions predate mandatory MFA; invalidate all of them.
-        connection.execute(text('DELETE FROM sessions'))
-    Base.metadata.create_all(engine); print('Beveiligingsschema bijgewerkt en bestaande sessies ingetrokken.')
+    raise SystemExit('Dit oude commando is vervangen. Zie docs/postgresql.md voor de overzetprocedure.')
 elif args.command=='bootstrap-admin':
     with Session(engine) as s:
         if s.scalar(select(Account.id).where(Account.role=='admin').limit(1)) is not None:
