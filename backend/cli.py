@@ -1,10 +1,10 @@
 """Lokale beheercommando's; alleen toegankelijk voor de systeembeheerder."""
-import getpass, argparse
+import getpass, argparse, sys
 from sqlalchemy import select, delete, inspect, text
 from sqlalchemy.orm import Session
 from app import Base,engine,Account,Person,LoginSession,RecoveryCode,Audit,ph
 
-p=argparse.ArgumentParser(); p.add_argument('command',choices=['init','migrate-auth','account','reset-password','reset-mfa']); p.add_argument('--username'); p.add_argument('--role',choices=['admin','manager','user'],default='admin'); p.add_argument('--person-id',type=int); args=p.parse_args()
+p=argparse.ArgumentParser(); p.add_argument('command',choices=['init','migrate-auth','bootstrap-admin','account','reset-password','reset-mfa']); p.add_argument('--username'); p.add_argument('--role',choices=['admin','manager','user'],default='admin'); p.add_argument('--person-id',type=int); args=p.parse_args()
 if args.command=='init':
     Base.metadata.create_all(engine); print('Database aangemaakt. Voor bestaande databases: voer migrate-auth uit.')
 elif args.command=='migrate-auth':
@@ -20,6 +20,24 @@ elif args.command=='migrate-auth':
         # Old sessions predate mandatory MFA; invalidate all of them.
         connection.execute(text('DELETE FROM sessions'))
     Base.metadata.create_all(engine); print('Beveiligingsschema bijgewerkt en bestaande sessies ingetrokken.')
+elif args.command=='bootstrap-admin':
+    with Session(engine) as s:
+        if s.scalar(select(Account.id).where(Account.role=='admin').limit(1)) is not None:
+            print('Er bestaat al een beheerder. Het bestaande account blijft ongewijzigd.')
+        else:
+            if not sys.stdin.isatty() or not sys.stdout.isatty():
+                raise SystemExit('Een interactieve terminal is vereist om de eerste beheerder aan te maken.')
+            username=input('Gebruikersnaam voor de eerste beheerder: ').strip()
+            if not username or len(username)>120:
+                raise SystemExit('Geef een gebruikersnaam van 1 tot 120 tekens op.')
+            if s.scalar(select(Account.id).where(Account.username==username)) is not None:
+                raise SystemExit('Deze gebruikersnaam bestaat al; kies een andere naam en start opnieuw.')
+            password=getpass.getpass('Nieuw wachtwoord (minimaal 12 tekens): ')
+            if len(password)<12 or password!=getpass.getpass('Herhaal wachtwoord: '):
+                raise SystemExit('Wachtwoorden ongeldig of verschillend; er is geen account aangemaakt.')
+            a=Account(username=username,password_hash=ph.hash(password),role='admin'); s.add(a); s.flush()
+            s.add(Audit(account_id=a.id,action='local_account_created')); s.commit()
+            print('De eerste beheerder is aangemaakt. Stel TOTP in bij de eerste aanmelding.')
 else:
     if not args.username: p.error('--username is vereist')
     with Session(engine) as s:

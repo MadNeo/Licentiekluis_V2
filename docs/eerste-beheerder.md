@@ -2,7 +2,7 @@
 
 Deze instructie geldt voor de huidige **lokale ontwikkelversie** van LicentieKluis. De applicatie is nog niet geschikt voor echte licenties, productiegebruik of installatie op een netwerk. Er is nog geen geteste Proxmox-installatieprocedure.
 
-De eerste beheerder wordt op de machine zelf aangemaakt met een terminalcommando. Er is geen standaardwachtwoord en geen openbare installatiewizard. Het wachtwoord wordt interactief gevraagd en is tijdens het typen niet zichtbaar.
+De eerste beheerder wordt tijdens de lokale installatie via een terminal aangemaakt. Er is geen standaardwachtwoord en geen openbare installatiewizard. Het wachtwoord wordt interactief gevraagd en is tijdens het typen niet zichtbaar.
 
 ## Voorbereiding
 
@@ -11,13 +11,13 @@ De eerste beheerder wordt op de machine zelf aangemaakt met een terminalcommando
 - Je hebt een authenticator-app die TOTP ondersteunt en een veilige plek voor de herstelcodes.
 - Gebruik voor deze stappen uitsluitend een lokale ontwikkelomgeving met fictieve gegevens.
 
-Alle onderstaande commando's gaan ervan uit dat de terminal in de hoofdmap van de repository staat. Installeer de afhankelijkheden als dit nog niet is gebeurd:
+Alle onderstaande commando's gaan ervan uit dat de terminal in de hoofdmap van de repository staat. Start de lokale installatie:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-npm ci --prefix frontend
+./install.sh
 ```
+
+Het script installeert de ontwikkelafhankelijkheden, initialiseert de database en vraagt bij de eerste installatie om een beheerdersnaam en wachtwoord. Voer het interactief uit; het wachtwoord wordt niet op het scherm getoond. Bij opnieuw uitvoeren blijft een bestaand beheerdersaccount ongewijzigd. Als de afhankelijkheden al zijn geïnstalleerd, kun je `./install.sh --zonder-afhankelijkheden` gebruiken.
 
 ## 1. Encryptiesleutel voorbereiden
 
@@ -37,25 +37,18 @@ Laad de bestaande sleutel in de huidige terminal:
 export LICENTIEKLUIS_KEY="$(cat "$HOME/.config/licentiekluis/sleutel")"
 ```
 
-## 2. Database initialiseren en beheerder aanmaken
+## 2. Beheerder controleren
 
-De huidige lokale standaard gebruikt SQLite. Voer in dezelfde terminal uit:
+Tijdens `./install.sh` heb je de gebruikersnaam en een uniek wachtwoord van minimaal 12 tekens opgegeven en het wachtwoord herhaald. Er verschijnen geen tekens tijdens het typen; dat is normaal. Bij succes meldt het script dat de eerste beheerder is aangemaakt. De beheerder hoeft niet aan een persoon gekoppeld te zijn.
 
-```bash
-cd backend
-../.venv/bin/python cli.py init
-../.venv/bin/python cli.py account --username beheerder --role admin
-```
-
-Je mag `beheerder` vervangen door een eigen gebruikersnaam. Kies op de prompt een uniek wachtwoord van minimaal 12 tekens en herhaal het. Er verschijnen geen tekens tijdens het typen; dat is normaal. Bij succes verschijnt `Actie uitgevoerd.`
-
-Deze eerste beheerder hoeft niet aan een persoon gekoppeld te zijn. Het commando creëert een account voor de database waarnaar de huidige configuratie verwijst. Als `DATABASE_URL` niet is ingesteld, wordt het SQLite-bestand `backend/licentiekluis.db` gebruikt. Als de gebruikersnaam al bestaat, stopt het commando zonder het bestaande account te wijzigen.
+Het script gebruikt de database waarnaar de huidige configuratie verwijst. Als `DATABASE_URL` niet is ingesteld, wordt het SQLite-bestand `backend/licentiekluis.db` gebruikt. Als er al een beheerder bestaat, ook als die is gedeactiveerd, maakt het script geen nieuwe aan en laat het de bestaande accounts ongemoeid. Voor herstel gebruik je de lokale commando's onder **Bij problemen**.
 
 ## 3. Applicatie lokaal starten
 
-Start vanuit dezelfde terminal, die nog in de map `backend` staat:
+Ga in dezelfde terminal naar de backendmap en start de server:
 
 ```bash
+cd backend
 export COOKIE_SECURE=false
 ../.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000
 ```
